@@ -64,7 +64,8 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
   // The number of validRows.
   int32_t const numValidRows{TileSizePerCtaQ};
-  // The seqOffsetQ.
+  // The seqOffsetQ. (0.6.11.postN predates the mMaxNumCtasQ regression that PR #3393's
+  // fmhaReduction.cu hunk fixes; this release already uses token units via mMaxSeqLenQ.)
   int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr ? batchIdx * params.mMaxSeqLenQ
                                                             : params.ptrCumSeqLensQ[batchIdx]};
   // The seqLenQ.
@@ -116,8 +117,9 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   // Whether to store the softmax stats.
   bool const storesSoftmaxStats{params.ptrSoftmaxStats != nullptr};
 
-  // The softmaxScaleLog2.
-  float const softmaxScaleLog2 = params.mScaleSoftmaxLog2;
+  // The softmaxScaleLog2. Prefer the device-side scale when supplied.
+  float const softmaxScaleLog2 = params.ptrScaleSoftmaxLog2 != nullptr ? *params.ptrScaleSoftmaxLog2
+                                                                       : params.mScaleSoftmaxLog2;
 
   int32_t constexpr NumBytesPerPartialElt{sizeof(DtypePartialO)};
   static_assert(NumBytesPerPartialElt == 2,
