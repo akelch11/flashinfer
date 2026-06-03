@@ -1784,6 +1784,15 @@ def test_trtllm_batch_prefill_head_dim_512(
         (128, 3, 16, 4, 8),
         (1, 6, 64, 2, 8),
         (4, 8, 64, 2, 8),
+        # numTokensHeadsQ = head_grp_size * q_len_per_req groups into the KeepsMmaAb tile:
+        # the cases above reach Q64 (<= 64); the two below reach Q128 (= 8 * 16), the largest
+        # GQA-generation tile and the one used by gemma-4 global (head_dim=512) layers under
+        # DFlash speculative decode (block_size = q_len_per_req = 16, numHeadsQPerKv = 8).
+        # Q128 is otherwise uncovered; combined with max_in_kv_len above it exercises both the
+        # single-CTA-KV (reduction disabled) and multi-CTA-KV (GmemReductionWithSeparateKernel)
+        # paths, and batch_size > 1 exercises per-batch seqOffsetQ in the separate reduction.
+        (1, 16, 64, 2, 8),
+        (4, 16, 64, 2, 8),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])
