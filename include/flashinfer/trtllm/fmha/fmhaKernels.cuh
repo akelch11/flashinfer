@@ -667,9 +667,16 @@ class TllmGenFmhaKernel {
       // Current GQA keepsMmaAb H512 cubins are registered in the split-V
       // headDimPerCtaV=256 form; full-V H512 is a cubin coverage follow-up.
       selectKernelParams.mHeadDimPerCtaV = 256;
-      if (multiCtasKvEnabled) {
-        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
-      }
+      // post1 adaptation: this release's separate reduction kernel (runFmhaReduction in
+      // fmhaReduction.cu) is implemented for MLA only (headDimQk==576). The multi-CTA-KV
+      // GmemReductionWithSeparateKernel path that newer flashinfer / PR #3393 uses is therefore
+      // unavailable for the non-MLA H512 (headDimQk==512) GQA-generation case and aborts with
+      // "Not implemented" at fmhaReduction.cu:303. Disable the multi-CTA-KV split and use the
+      // single-CTA-KV keepsMmaAb cubin instead (correct, but no cross-CTA KV parallelism for very
+      // long contexts). Restore GmemReductionWithSeparateKernel once runFmhaReduction supports
+      // non-MLA H512.
+      (void)multiCtasKvEnabled;
+      selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
     } else {
       // SwapsMmaAb hashes the full-V form; undo a previous keepsMmaAb separate-reduction upgrade
       // when the tile-size cost model walks back to swapsMmaAb.
