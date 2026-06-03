@@ -666,17 +666,13 @@ class TllmGenFmhaKernel {
         params.mHeadDimV > 256) {
       // Current GQA keepsMmaAb H512 cubins are registered in the split-V
       // headDimPerCtaV=256 form; full-V H512 is a cubin coverage follow-up.
+      // NOTE: at post1 this branch is unreachable for headDimV>256 because
+      // selectGqGenerationKernel routes non-MLA H512 to swapsMmaAb (post1's separate reduction
+      // kernel is MLA-only). Kept in upstream form for parity / future cubin coverage.
       selectKernelParams.mHeadDimPerCtaV = 256;
-      // post1 adaptation: this release's separate reduction kernel (runFmhaReduction in
-      // fmhaReduction.cu) is implemented for MLA only (headDimQk==576). The multi-CTA-KV
-      // GmemReductionWithSeparateKernel path that newer flashinfer / PR #3393 uses is therefore
-      // unavailable for the non-MLA H512 (headDimQk==512) GQA-generation case and aborts with
-      // "Not implemented" at fmhaReduction.cu:303. Disable the multi-CTA-KV split and use the
-      // single-CTA-KV keepsMmaAb cubin instead (correct, but no cross-CTA KV parallelism for very
-      // long contexts). Restore GmemReductionWithSeparateKernel once runFmhaReduction supports
-      // non-MLA H512.
-      (void)multiCtasKvEnabled;
-      selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
+      if (multiCtasKvEnabled) {
+        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
+      }
     } else {
       // SwapsMmaAb hashes the full-V form; undo a previous keepsMmaAb separate-reduction upgrade
       // when the tile-size cost model walks back to swapsMmaAb.
@@ -741,16 +737,21 @@ class TllmGenFmhaKernel {
 
     // The minimum modeling kernel time.
     float globalModelingKernelTime = FLT_MAX;
+    // post1: non-MLA H512 must use swapsMmaAb (keepsMmaAb multi-CTA needs the MLA-only separate
+    // reduction kernel), and only Q{8,16,32} swaps cubins ship for H512 -> cap the tile here.
+    int const maxTileSizeQ = (params.mHeadDimV > 256) ? 32 : 128;
     // Loop over each candidate tile size.
     for (int tileSizeQ : candidateTileSizesQ) {
       // Only consider candidates <= default tileSizeQ and ensure each CTA processes full
       // numHeadsQPerKv.
-      if (tileSizeQ > defaultTileSizeQ || tileSizeQ < params.mNumHeadsQPerKv) {
+      if (tileSizeQ > defaultTileSizeQ || tileSizeQ > maxTileSizeQ ||
+          tileSizeQ < params.mNumHeadsQPerKv) {
         continue;
       }
 
       selectKernelParamsCopy.mTileSizeQ = tileSizeQ;
-      if (tileSizeQ >= 64) {
+      // keepsMmaAb only for headDimV<=256; non-MLA H512 always uses swapsMmaAb (see above).
+      if (tileSizeQ >= 64 && params.mHeadDimV <= 256) {
         selectKernelParamsCopy.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
       } else {
         selectKernelParamsCopy.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
@@ -793,8 +794,8 @@ class TllmGenFmhaKernel {
 
     // Update the tileSizeQ.
     selectKernelParams.mTileSizeQ = selectedTileSizeQ;
-    // Update the kernel type.
-    if (selectKernelParams.mTileSizeQ >= 64) {
+    // Update the kernel type. keepsMmaAb only for headDimV<=256; non-MLA H512 stays swapsMmaAb.
+    if (selectKernelParams.mTileSizeQ >= 64 && params.mHeadDimV <= 256) {
       selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
     } else {
       selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
@@ -815,6 +816,24 @@ class TllmGenFmhaKernel {
     if (mDtypeQ != mDtypeK || mDtypeQ != mDtypeV) {
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      return;
+    }
+
+    // post1: non-MLA H512 (headDimQk==headDimV==512) GQA generation must use swapsMmaAb. The
+    // keepsMmaAb H512 multi-CTA-KV path needs GmemReductionWithSeparateKernel, but this release's
+    // runFmhaReduction is implemented for MLA (headDimQk==576) only. swapsMmaAb holds the full
+    // headDimV in TMEM and reduces in-kernel (GmemReduction), so multi-CTA-KV parallelism works
+    // without the separate reduction kernel. Only Q{8,16,32} swaps cubins ship for H512, so cap
+    // tileSizeQ at 32; the cost model below narrows within {8,16,32} when maxSeqLenQ>1, and
+    // numTokensHeadsQ>tileSizeQ is split across Q-CTAs by computeCtaAndClusterConfig.
+    if (params.mHeadDimV > 256) {
+      int const nth = params.mNumHeadsQPerKv * params.mMaxSeqLenQ;
+      tileSizeQ = nth <= 8 ? 8 : (nth <= 16 ? 16 : 32);  // swaps caps at Q32 for H512
+      kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      syncGqaGenerationTraitsForKernelHash(params, selectKernelParams);
+      if (params.mMaxSeqLenQ > 1) {
+        selectTileSizeQForGqaGeneration(params, selectKernelParams);
+      }
       return;
     }
 
